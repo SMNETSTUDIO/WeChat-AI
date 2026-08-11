@@ -4529,10 +4529,13 @@
         btn.onclick = async () => {
           const key = btn.dataset.as;
           const [botAccountId, peerId] = key.split("|");
-          const sel =
-            btn.closest(".row-actions, .mcard, tr")?.querySelector(
-              `select[data-asg="${CSS.escape(key)}"]`,
-            ) || document.querySelector(`select[data-asg="${CSS.escape(key)}"]`);
+          // Both the desktop table and mobile cards are rendered at once.
+          // Scope the lookup to the button's peer row/card so a mobile action
+          // never reads the hidden desktop select with the same data-asg key.
+          const peerContainer = btn.closest(".mcard, tr");
+          const sel = peerContainer?.querySelector(
+            `select[data-asg="${CSS.escape(key)}"]`,
+          );
           if (!sel?.value) {
             toast("请先在人设广场添加人设", true);
             return;
