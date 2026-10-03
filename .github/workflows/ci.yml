@@ -19,11 +19,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The `test` scripts pass `src/**/*.test.ts` through to `node --test`
-        # and rely on Node's own glob expansion, which landed in 22. Node 20 is
+        # Test scripts quote `src/**/*.test.ts` so the shell cannot expand only
+        # nested tests and omit top-level files. Node expands the glob (22+). Node 20 is
         # past EOL, so the floor here is deliberately above package.json engines.
         node: [22, 24]
     name: node ${{ matrix.node }}
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      WECHAT_AI_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      REDIS_URL: redis://127.0.0.1:6379/14
     steps:
       - uses: actions/checkout@v7
 

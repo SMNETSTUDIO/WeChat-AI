@@ -14,6 +14,12 @@ import {
 import {
   type Db,
   type InboundJob,
+  type InboundClaim,
+  persistInbound,
+  claimInbound,
+  acknowledgeInbound,
+  retryInbound,
+  inboundQueueStats,
   K,
   claimBotLeases,
   getBotAccount,
@@ -85,6 +91,7 @@ import {
   type AdminSendResult,
 } from "./broadcast-runner.js";
 import { emitActivity, previewText } from "./activity-stream.js";
+import { InboundDelivery } from "./inbound-delivery.js";
 
 /**
  * How often a node sweeps the load-weight hash (refresh live entries, delete
@@ -130,9 +137,8 @@ export interface BroadcastWorkerConfig {
 /**
  * Inbound job plus the attachment coordinates for this message.
  *
- * `mediaRefs` is deliberately NOT on the shared `InboundJob` type: that one has
- * a Redis serializer in worker-fleet.ts, and these refs carry the CDN AES key —
- * anything holding them must stay in this process's memory.
+ * Media coordinates contain CDN credentials. The durable Redis inbox has the
+ * same trust boundary as bot credentials; never expose payloads via status APIs.
  */
 type LocalInboundJob = InboundJob & {
   mediaRefs?: InboundMediaRef[];
@@ -156,7 +162,7 @@ export interface WorkerOptions {
   workerWeightTtlSec?: number;
   /** Concurrent reply consumers (LLM + send) */
   replyConcurrency?: number;
-  /** Max in-process inbox depth before drop */
+  /** Max retained inbound jobs per bot, including failed jobs */
   inboxMaxLen?: number;
   /** multi-bubble human-like reply */
   splitReply?: boolean;
@@ -214,6 +220,7 @@ export interface WorkerRuntimeStats {
   maxBots: number;
   atCapacity: boolean;
   inboxDepth: number;
+  inboxFailed: number;
   inboxMaxLen: number;
   inboxPeak: number;
   inboxDropped: number;
@@ -293,9 +300,9 @@ export class BotWorkerManager {
   private loopGen = new Map<string, number>();
   private peerLimiter: RateLimiter;
 
-  /** In-process job queue (same container; no extra Redis BLPOP connection). */
-  private inbox: LocalInboundJob[] = [];
-  private inboxWaiters: Array<() => void> = [];
+  private claimingInbox = false;
+  private inboxScanAfter = 0;
+  private inboxBotOffset = 0;
   /** Serialize replies per bot:peer so bubbles stay ordered. */
   private peerChains = new Map<string, Promise<void>>();
 
@@ -324,16 +331,6 @@ export class BotWorkerManager {
   private p2pEnabled: boolean;
   /** Prevent concurrent OTA apply on the same process */
   private otaInFlight = false;
-  /**
-   * Process-local LRU of inbound dedup keys. iLink redelivers the same
-   * message on a non-advancing cursor / loop restart; without this gate
-   * each redelivery becomes a full LLM regeneration (near-duplicate replies).
-   * Redis NX covers multi-replica; this covers the single-process hot path
-   * without a round trip.
-   */
-  private inboundSeen = new Map<string, number>();
-  private static readonly INBOUND_SEEN_TTL_MS = 10 * 60_000;
-  private static readonly INBOUND_SEEN_MAX = 2_000;
 
   constructor(private opts: WorkerOptions) {
     this.workerId =
@@ -574,6 +571,8 @@ export class BotWorkerManager {
     const leasedLocal = this.loops.size;
     const atCapacity =
       leasedLocal >= this.maxBots && pollable > leasedLocal;
+    const inbox = await inboundQueueStats(this.opts.db, [...this.loops.keys()]);
+    this.inboxPeak = Math.max(this.inboxPeak, inbox.pending);
 
     return {
       workerId: this.workerId,
@@ -584,7 +583,8 @@ export class BotWorkerManager {
       pollable,
       maxBots: this.maxBots,
       atCapacity,
-      inboxDepth: this.inbox.length,
+      inboxDepth: inbox.pending,
+      inboxFailed: inbox.failed,
       inboxMaxLen: this.inboxMaxLen,
       inboxPeak: this.inboxPeak,
       inboxDropped: this.inboxDropped,
@@ -894,6 +894,7 @@ export class BotWorkerManager {
     botId: string,
     peerId: string,
     text: string,
+    clientId?: string,
   ): Promise<AdminSendResult> {
     const body = text?.trim();
     if (!body) return { ok: false, reason: "empty" };
@@ -932,6 +933,7 @@ export class BotWorkerManager {
         toUserId: peerId,
         text: body,
         contextToken,
+        clientId,
       });
       return { ok: true };
     } catch (err) {
@@ -986,9 +988,6 @@ export class BotWorkerManager {
     }
     this.loops.clear();
     this.clients.clear();
-    // Wake reply consumers so they can exit
-    for (const w of this.inboxWaiters) w();
-    this.inboxWaiters = [];
     this.unregisterPromise = unregisterWorker(
       this.opts.db,
       this.workerId,
@@ -999,17 +998,20 @@ export class BotWorkerManager {
   private unregisterPromise: Promise<void> | null = null;
 
   /**
-   * Stop and wait for the fleet deregistration to land. Without awaiting it,
-   * SIGTERM races the exit and other nodes wait out LEASE_TTL_SEC before
-   * re-claiming this node's bots.
+   * Release polling ownership and drain started replies within the shutdown
+   * budget. Unacknowledged jobs remain recoverable in the shared inbox.
    */
-  async stopAsync(timeoutMs = 5000): Promise<void> {
+  async stopAsync(timeoutMs = 25_000): Promise<void> {
     this.stop();
-    if (!this.unregisterPromise) return;
-    await Promise.race([
-      this.unregisterPromise,
-      new Promise<void>((r) => setTimeout(r, timeoutMs).unref?.()),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Queued jobs stay in Redis. Give active jobs a chance to ACK before exit;
+    // any remaining processing claims expire and are recovered by another node.
+    try {
+      await Promise.race([
+        Promise.allSettled([this.unregisterPromise, ...this.replyWorkers]),
+        new Promise<void>((r) => { timer = setTimeout(r, timeoutMs); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   /** Subscribe to fleet wake channel so new bots attach without waiting full lease tick. */
@@ -1559,22 +1561,7 @@ export class BotWorkerManager {
         allowInstall: this.opts.otaAllowInstall !== false,
         log: this.opts.log,
         beforeRestart: async () => {
-          // Drain fleet membership so peers pick up bots quickly
-          this.stopped = true;
-          this.runtimeActive = false;
-          try {
-            const owned = [...this.loops.keys()];
-            if (owned.length) {
-              await releaseOwnedLeasesBatch(
-                this.opts.db,
-                this.workerId,
-                owned,
-              );
-            }
-          } catch {
-            /* */
-          }
-          this.stop();
+          await this.stopAsync();
         },
       });
       if (result === "applied") {
@@ -1808,7 +1795,7 @@ export class BotWorkerManager {
         const buf = res.get_updates_buf;
         if (typeof buf === "string" && buf !== "" && buf !== cursor) {
           try {
-            await setBotCursor(this.opts.db, botId, buf);
+            await setBotCursor(this.opts.db, botId, buf, this.workerId);
             cursor = buf;
           } catch (e) {
             // Still advance in-memory so we don't hot-loop the same batch;
@@ -1873,60 +1860,6 @@ export class BotWorkerManager {
     return createHash("sha1").update(raw).digest("hex").slice(0, 32);
   }
 
-  /** True when this key was already claimed (local LRU and/or Redis NX). */
-  private async claimInboundOnce(dedupKey: string): Promise<boolean> {
-    const now = Date.now();
-    // Expire stale local entries cheaply on the hot path.
-    const localAt = this.inboundSeen.get(dedupKey);
-    if (localAt !== undefined) {
-      if (now - localAt < BotWorkerManager.INBOUND_SEEN_TTL_MS) {
-        return false;
-      }
-      this.inboundSeen.delete(dedupKey);
-    }
-    // Bound the map so a long-lived process cannot grow forever.
-    if (this.inboundSeen.size >= BotWorkerManager.INBOUND_SEEN_MAX) {
-      const cutoff = now - BotWorkerManager.INBOUND_SEEN_TTL_MS;
-      for (const [k, t] of this.inboundSeen) {
-        if (t < cutoff) this.inboundSeen.delete(k);
-      }
-      // Still full? drop oldest half.
-      if (this.inboundSeen.size >= BotWorkerManager.INBOUND_SEEN_MAX) {
-        const keys = [...this.inboundSeen.keys()].slice(
-          0,
-          Math.floor(BotWorkerManager.INBOUND_SEEN_MAX / 2),
-        );
-        for (const k of keys) this.inboundSeen.delete(k);
-      }
-    }
-
-    // Multi-replica: Redis NX is the real gate. Local map is a free filter.
-    try {
-      const ok = await this.opts.db.redis.set(
-        K.inboundSeen(dedupKey),
-        "1",
-        "EX",
-        Math.ceil(BotWorkerManager.INBOUND_SEEN_TTL_MS / 1000),
-        "NX",
-      );
-      if (ok !== "OK") {
-        // Another node (or an earlier attempt) already claimed it.
-        this.inboundSeen.set(dedupKey, now);
-        return false;
-      }
-    } catch (e) {
-      // Redis blip: fall through to local-only claim so we do not drop the
-      // message entirely. At-most-once across replicas is best-effort then.
-      this.opts.log?.(
-        `[worker] inbound dedup redis failed: ${
-          e instanceof Error ? e.message : String(e)
-        }`,
-      );
-    }
-    this.inboundSeen.set(dedupKey, now);
-    return true;
-  }
-
   private async enqueueFromMessage(
     botId: string,
     client: ILinkClient,
@@ -1947,124 +1880,85 @@ export class BotWorkerManager {
     const mediaOnly = !text?.trim();
     const trimmed = text?.trim() ?? "";
 
-    // Claim BEFORE startTyping / inbox push so a redelivered inbound never
-    // burns a typing indicator or an LLM slot. iLink has no msg_id; the key
-    // is synthesized from create_time_ms + content (see inboundDedupKey).
-    const dedupKey = this.inboundDedupKey(
-      botId,
-      peerId,
-      msg,
-      trimmed,
-      mediaRefs,
-    );
-    const first = await this.claimInboundOnce(dedupKey);
-    if (!first) {
-      this.opts.log?.(
-        `[worker] drop redelivered inbound bot=${botId} peer=${peerId} key=${dedupKey.slice(0, 8)}`,
-      );
-      emitActivity({
-        type: "message.dedup",
-        level: "info",
-        source: this.workerId,
-        summary: `dedup drop bot=${botId} peer=${peerId}`,
-        data: { botId, peerId, dedupKey },
-      });
-      return;
-    }
-
-    // Typing ASAP; reply path may be delayed by queue. First call per peer also
-    // fetches the typing_ticket, which is then cached for ~20h.
-    void client
-      .startTyping({ toUserId: peerId, contextToken })
-      .catch(() => undefined);
-
-    if (this.inbox.length >= this.inboxMaxLen) {
-      this.inboxDropped++;
-      this.lastInboxDropAt = new Date().toISOString();
-      this.opts.log?.(
-        `[worker] inbox full (${this.inboxMaxLen}), drop msg bot=${botId} peer=${peerId} dropped=${this.inboxDropped}`,
-      );
-      emitActivity({
-        type: "worker.inbox_drop",
-        level: "warn",
-        source: this.workerId,
-        summary: `inbox full drop bot=${botId} peer=${peerId} total=${this.inboxDropped}`,
-        data: {
-          botId,
-          peerId,
-          inboxMaxLen: this.inboxMaxLen,
-          dropped: this.inboxDropped,
-        },
-      });
-      return;
-    }
-
     const job: LocalInboundJob = {
-      id: `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
-      botId,
-      peerId,
-      contextToken,
-      text: trimmed,
-      mediaOnly,
+      id: this.inboundDedupKey(botId, peerId, msg, trimmed, mediaRefs),
+      botId, peerId, contextToken, text: trimmed, mediaOnly,
       enqueuedAt: new Date().toISOString(),
       ...(mediaRefs.length ? { mediaRefs } : {}),
     };
+    // Persist before advancing the iLink cursor. Failure leaves the entire
+    // batch replayable; previously accepted jobs deduplicate against Redis.
+    const result = await persistInbound(this.opts.db, this.workerId, job, this.inboxMaxLen);
+    if (result === "duplicate") return;
+    this.inboxScanAfter = 0;
+    void client.startTyping({ toUserId: peerId, contextToken }).catch(() => undefined);
     emitActivity({
-      type: "message.in",
-      source: this.workerId,
-      summary: mediaOnly
-        ? `in media bot=${botId} peer=${peerId}`
-        : `in bot=${botId} peer=${peerId} ${(job.text || "").slice(0, 24)}`,
-      data: streamMessagePayload(job.text || (mediaOnly ? "[media]" : ""), {
-        botId,
-        peerId,
-        role: "user",
-        jobId: job.id,
-        mediaOnly: !!mediaOnly,
-      }),
+      type: "message.in", source: this.workerId,
+      summary: `in bot=${botId} peer=${peerId}`,
+      data: streamMessagePayload(job.text || "[media]", { botId, peerId, jobId: job.id, role: "user" }),
     });
-    this.inbox.push(job);
-    if (this.inbox.length > this.inboxPeak) {
-      this.inboxPeak = this.inbox.length;
+  }
+
+  // Only one idle scanner per process, regardless of REPLY_CONCURRENCY.
+  private async waitForJob(): Promise<InboundClaim<LocalInboundJob> | null> {
+    if (this.stopped) return null;
+    if (this.claimingInbox || Date.now() < this.inboxScanAfter) {
+      await sleep(100);
+      return null;
     }
-    const w = this.inboxWaiters.shift();
-    if (w) w();
+    this.claimingInbox = true;
+    try {
+      const ids = [...this.loops.keys()];
+      for (let i = 0; i < ids.length && !this.stopped; i++) {
+        const botId = ids[this.inboxBotOffset++ % ids.length]!;
+        const claim = await claimInbound<LocalInboundJob>(this.opts.db, botId, this.workerId);
+        if (claim) return claim;
+      }
+      this.inboxScanAfter = Date.now() + 1000;
+      return null;
+    } finally { this.claimingInbox = false; }
   }
 
-  // ── Reply ────────────────────────────────────────────
-
-  private waitForJob(timeoutMs: number): Promise<LocalInboundJob | null> {
-    if (this.inbox.length > 0) return Promise.resolve(this.inbox.shift()!);
-    if (this.stopped) return Promise.resolve(null);
-
-    return new Promise((resolve) => {
-      let settled = false;
-      const onReady = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(this.inbox.shift() ?? null);
-      };
-      this.inboxWaiters.push(onReady);
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        const idx = this.inboxWaiters.indexOf(onReady);
-        if (idx >= 0) this.inboxWaiters.splice(idx, 1);
-        resolve(this.inbox.shift() ?? null);
-      }, timeoutMs);
-    });
-  }
-
-  private async runReplyConsumer(idx: number): Promise<void> {
+  private async runReplyConsumer(_idx: number): Promise<void> {
     while (!this.stopped) {
-      const job = await this.waitForJob(2000);
-      if (!job) continue;
-      await this.enqueuePeerChain(job.botId, job.peerId, () =>
-        this.handleJob(job),
-      );
+      let claim: InboundClaim<LocalInboundJob> | null = null;
+      let delivery: InboundDelivery | undefined;
+      try {
+        claim = await this.waitForJob();
+        if (!claim) continue;
+        if (this.stopped) {
+          await retryInbound(this.opts.db, claim, 0);
+          break;
+        }
+        delivery = new InboundDelivery(this.opts.db, claim);
+        // A bot can move to another node while this job is in progress. Its
+        // independent peer claim keeps replies ordered until ACK or expiry.
+        let rawClient = this.clients.get(claim.job.botId);
+        if (!rawClient) {
+          const creds = await this.loadBotToken(claim.job.botId);
+          if (!creds) throw new Error("No credentials for queued bot");
+          rawClient = new ILinkClient({ botToken: creds.botToken, baseUrl: creds.baseUrl ?? undefined });
+        }
+        const active = delivery;
+        const job = claim.job;
+        const client = rawClient;
+        let succeeded = false;
+        await this.enqueuePeerChain(job.botId, job.peerId, async () => {
+          await this.handleJob(job, client, active);
+          succeeded = true;
+        });
+        if (!succeeded) throw new Error("Inbound reply failed");
+        await acknowledgeInbound(this.opts.db, claim);
+      } catch (err) {
+        delivery?.close();
+        this.jobsFailed++;
+        this.opts.log?.(`[worker] durable reply pending retry: ${err instanceof Error ? err.message : String(err)}`);
+        if (claim) {
+          await retryInbound(this.opts.db, claim).catch(() => undefined);
+        }
+        await sleep(1000);
+      } finally { delivery?.close(); }
     }
-    void idx;
   }
 
   /**
@@ -2074,10 +1968,9 @@ export class BotWorkerManager {
    * rejection, rate limit, P2P relay hand-off, or crash returned without a stop
    * the peer would keep seeing "对方正在输入中" until the server timed it out.
    */
-  private async handleJob(job: LocalInboundJob): Promise<void> {
-    const client = this.clients.get(job.botId);
+  private async handleJob(job: LocalInboundJob, client: ILinkClient, delivery: InboundDelivery): Promise<void> {
     try {
-      await this.handleJobInner(job);
+      await this.handleJobInner(job, client, delivery);
     } finally {
       if (client) {
         await client
@@ -2090,24 +1983,8 @@ export class BotWorkerManager {
     }
   }
 
-  private async handleJobInner(job: LocalInboundJob): Promise<void> {
+  private async handleJobInner(job: LocalInboundJob, client: ILinkClient, delivery: InboundDelivery): Promise<void> {
     const t0 = Date.now();
-    const client = this.clients.get(job.botId);
-    if (!client) {
-      this.jobsFailed++;
-      this.opts.log?.(
-        `[worker] no client for bot=${job.botId}, drop job ${job.id}`,
-      );
-      emitActivity({
-        type: "worker.fail",
-        level: "error",
-        source: this.workerId,
-        summary: `no client bot=${job.botId} job=${job.id}`,
-        data: { botId: job.botId, peerId: job.peerId, jobId: job.id },
-      });
-      return;
-    }
-
     // Always refresh context_token so later P2P / proactive push can reach this peer
     try {
       await upsertContextToken(
@@ -2121,48 +1998,40 @@ export class BotWorkerManager {
     }
 
     const rateKey = `${job.botId}:${job.peerId}`;
-    if (!this.peerLimiter.tryTake(rateKey)) {
-      try {
-        const rateText = "你发得太快啦，请稍等一会儿再聊～";
-        await client.sendText({
-          toUserId: job.peerId,
-          text: rateText,
-          contextToken: job.contextToken,
-        });
-        this.jobsProcessed++;
-        emitActivity({
-          type: "message.reject",
-          level: "warn",
-          source: this.workerId,
-          summary: `rate limit bot=${job.botId} peer=${job.peerId}`,
-          data: streamMessagePayload(rateText, {
-            botId: job.botId,
-            peerId: job.peerId,
-            role: "system",
-            reason: "rate_limit",
-            jobId: job.id,
-            ms: Date.now() - t0,
-          }),
-        });
-      } catch {
-        this.jobsFailed++;
-      }
+    if (!(await delivery.step("rate", async () => this.peerLimiter.tryTake(rateKey)))) {
+      const rateText = "你发得太快啦，请稍等一会儿再聊～";
+      await delivery.client(client, "rate-reply").sendText({
+        toUserId: job.peerId,
+        text: rateText,
+        contextToken: job.contextToken,
+      });
+      this.jobsProcessed++;
+      emitActivity({
+        type: "message.reject",
+        level: "warn",
+        source: this.workerId,
+        summary: `rate limit bot=${job.botId} peer=${job.peerId}`,
+        data: streamMessagePayload(rateText, {
+          botId: job.botId, peerId: job.peerId, role: "system",
+          reason: "rate_limit", jobId: job.id, ms: Date.now() - t0,
+        }),
+      });
       return;
     }
 
-    // ── P2P intercept (no LLM) ───────────────────────────
-    if (this.p2pEnabled && this.p2p) {
+    // Keep the routing decision stable if P2P settings change between retries.
+    {
       try {
-        const p2pResult = await this.p2p.handleInbound({
+        const p2pResult = await delivery.step("p2p", async () => this.p2pEnabled && this.p2p ? this.p2p.handleInbound({
           botId: job.botId,
           peerId: job.peerId,
           text: job.text,
           mediaOnly: job.mediaOnly || !job.text.trim(),
-        });
+        }) : { handled: false, localReplies: [], remoteSends: [] });
         if (p2pResult.handled) {
-          for (const text of p2pResult.localReplies) {
+          for (const [i, text] of p2pResult.localReplies.entries()) {
             if (!text?.trim()) continue;
-            await client.sendText({
+            await delivery.client(client, `p2p-local:${i}`).sendText({
               toUserId: job.peerId,
               text: text.trim(),
               contextToken: job.contextToken,
@@ -2180,12 +2049,10 @@ export class BotWorkerManager {
               }),
             });
           }
-          for (const remote of p2pResult.remoteSends) {
-            await this.sendToEndpoint(
-              remote.botId,
-              remote.peerId,
-              remote.text,
-            );
+          for (const [i, remote] of p2pResult.remoteSends.entries()) {
+            await delivery.step(`p2p-remote:${i}`, () => this.sendToEndpoint(
+              remote.botId, remote.peerId, remote.text, delivery.clientId(`p2p-remote:${i}`),
+            ));
           }
           this.jobsProcessed++;
           emitActivity({
@@ -2208,31 +2075,8 @@ export class BotWorkerManager {
             err instanceof Error ? err.message : String(err)
           }`,
         );
-        // Fall through to roleplay rather than hard-fail chat
+        throw err;
       }
-    }
-
-    // Fetch + decrypt attachments here rather than in the poll loop: the long
-    // poll must stay responsive, and this is already the serialized per-peer
-    // chain where the LLM call happens.
-    const attachments = job.mediaRefs?.length
-      ? await this.buildAttachments(client, job, job.mediaRefs)
-      : [];
-
-    // Nothing the model could respond to: no text, and no attachment it can
-    // actually perceive. Answer from a canned line instead of burning a turn.
-    if (!job.text.trim() && !attachments.some((a) => a.dataUri)) {
-      try {
-        await client.sendText({
-          toUserId: job.peerId,
-          text: unreadableMediaReply(job.mediaRefs ?? []),
-          contextToken: job.contextToken,
-        });
-        this.jobsProcessed++;
-      } catch {
-        this.jobsFailed++;
-      }
-      return;
     }
 
     void client
@@ -2243,16 +2087,23 @@ export class BotWorkerManager {
       .catch(() => undefined);
 
     try {
-      const result = await this.opts.chat.handleInbound({
-        botAccountId: job.botId,
-        peerId: job.peerId,
-        text: job.text.trim(),
-        contextToken: job.contextToken,
-        attachments,
+      // Persist the decision as well as the generated reply. A recovered media
+      // job must not switch to a canned response after its CDN URL expires.
+      const result = await delivery.step("chat", async () => {
+        const attachments = job.mediaRefs?.length
+          ? await this.buildAttachments(client, job, job.mediaRefs)
+          : [];
+        if (!job.text.trim() && !attachments.some((a) => a.dataUri)) {
+          return { kind: "reject" as const, text: unreadableMediaReply(job.mediaRefs ?? []) };
+        }
+        return this.opts.chat.handleInbound({
+          botAccountId: job.botId, peerId: job.peerId, text: job.text.trim(),
+          contextToken: job.contextToken, attachments,
+        });
       });
 
       if (result.kind === "reject" && result.text) {
-        await client.sendText({
+        await delivery.client(client, "reject").sendText({
           toUserId: job.peerId,
           text: result.text,
           contextToken: job.contextToken,
@@ -2271,33 +2122,36 @@ export class BotWorkerManager {
           }),
         });
       } else if (result.kind === "reply") {
-        let parts: ReplyPart[] =
-          result.parts && result.parts.length > 0
-            ? result.parts
-            : result.bubbles && result.bubbles.length > 0
-              ? result.bubbles.map((t) => ({ kind: "text" as const, text: t }))
-              : result.text
-                ? [{ kind: "text" as const, text: result.text }]
-                : [];
-        // Worker-side validation: never send raw sticker JSON as text
-        parts = sanitizePartsStripStickerJson(parts, this.maxStickersPerReply());
+        const parts = await delivery.step("parts", async () => {
+          const proposed: ReplyPart[] =
+            result.parts && result.parts.length > 0
+              ? result.parts
+              : result.bubbles && result.bubbles.length > 0
+                ? result.bubbles.map((t) => ({ kind: "text" as const, text: t }))
+                : result.text
+                  ? [{ kind: "text" as const, text: result.text }]
+                  : [];
+          // Worker-side validation: never send raw sticker JSON as text.
+          const sanitized = sanitizePartsStripStickerJson(proposed, this.maxStickersPerReply());
+          return this.opts.splitReply === false ? sanitized.slice(0, 1) : sanitized;
+        });
         if (parts.length === 0) {
           /* empty */
         } else {
           // ChatService already loaded the bot row — it hands the owner back
           // on the result rather than making us re-read it per message.
           const ownerUserId = result.ownerUserId || "";
-          if (this.opts.splitReply === false || parts.length === 1) {
+          if (parts.length === 1) {
             this.opts.log?.(
               `[worker] send 1 part peer=${job.peerId} kind=${parts[0]!.kind}`,
             );
-            await this.sendReplyPart(
-              client,
+            await delivery.step("part:0", () => this.sendReplyPart(
+              delivery.client(client, "part:0"),
               job.peerId,
               job.contextToken,
               parts[0]!,
               ownerUserId,
-            );
+            ));
           } else {
             this.opts.log?.(
               `[worker] send ${parts.length} parts peer=${job.peerId}` +
@@ -2309,6 +2163,7 @@ export class BotWorkerManager {
               job.contextToken,
               parts,
               ownerUserId,
+              delivery,
             );
           }
           const outText =
@@ -2363,7 +2218,6 @@ export class BotWorkerManager {
         },
       });
     } catch (err) {
-      this.jobsFailed++;
       this.opts.log?.(
         `[worker] chat failed peer=${job.peerId}: ${(err as Error).message}`,
       );
@@ -2380,15 +2234,7 @@ export class BotWorkerManager {
           ms: Date.now() - t0,
         },
       });
-      try {
-        await client.sendText({
-          toUserId: job.peerId,
-          text: "抱歉，我这边刚才出了点问题，请稍后再试。",
-          contextToken: job.contextToken,
-        });
-      } catch {
-        /* ignore */
-      }
+      throw err;
     }
   }
 
@@ -2452,15 +2298,16 @@ export class BotWorkerManager {
     botId: string,
     peerId: string,
     text: string,
+    clientId?: string,
   ): Promise<void> {
-    const result = await this.adminSendText(botId, peerId, text);
+    const result = await this.adminSendText(botId, peerId, text, clientId);
     if (!result.ok) {
       this.opts.log?.(
         `[worker] p2p send skip bot=${botId} peer=${peerId} reason=${result.reason}${
           result.error ? ` err=${result.error}` : ""
         }`,
       );
-      return;
+      throw new Error(`P2P delivery failed: ${result.reason}`);
     }
     this.opts.log?.(
       `[worker] p2p sent bot=${botId} peer=${peerId}`,
@@ -2473,6 +2320,7 @@ export class BotWorkerManager {
     contextToken: string,
     parts: ReplyPart[],
     ownerUserId: string,
+    delivery?: InboundDelivery,
   ): Promise<void> {
     const list = parts.filter(
       (p) =>
@@ -2498,13 +2346,15 @@ export class BotWorkerManager {
           .catch(() => undefined);
         await sleep(rand(200, 500));
       }
-      await this.sendReplyPart(
-        client,
+      const send = () => this.sendReplyPart(
+        delivery ? delivery.client(client, `part:${i}`) : client,
         peerId,
         contextToken,
         part,
         ownerUserId,
       );
+      if (delivery) await delivery.step(`part:${i}`, send);
+      else await send();
     }
   }
 
@@ -2587,7 +2437,7 @@ export class BotWorkerManager {
       this.opts.log?.(
         `[worker] sticker send failed slug=${part.slug}: ${(err as Error).message}`,
       );
-      // Do not fail the whole chain — skip this bubble
+      throw err;
     }
   }
 }

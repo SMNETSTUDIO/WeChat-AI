@@ -130,6 +130,8 @@ Auth: **Cookie 会话**（OAuth 登录后 `wa_session`），`credentials: includ
 | PATCH | `/api/v1/admin/bots/:botId` | 改名 / `{ status: active\|inactive }` 启停 |
 | POST | `/api/v1/admin/bots/:botId/stop-worker` | **仅超管** 停止 Worker 轮询 |
 | POST | `/api/v1/admin/bots/:botId/start-worker` | **仅超管** 启动/重启 Worker（需已有 Redis token） |
+| GET | `/api/v1/admin/bots/:botId/inbox` | **仅超管** `pending` / `failed` 计数和最多 100 条失败任务元数据，不含消息正文或凭据 |
+| POST | `/api/v1/admin/bots/:botId/inbox/:jobId/retry` | **仅超管** 将失败任务追加回对应聊天对象队尾，保留检查点、重置重试次数；写审计 |
 | DELETE | `/api/v1/admin/bots/:botId` | 删除机器人 |
 | GET | `/api/v1/admin/bots/:botId/send-targets` | **仅超管** 该 bot 的 peers + `hasContextToken`（广播勾选） |
 | POST | `/api/v1/admin/broadcast` | **仅超管** 创建广播任务或 `preview:true` 仅预估人数 |
@@ -174,7 +176,7 @@ Auth: **Cookie 会话**（OAuth 登录后 `wa_session`），`credentials: includ
 | `WORKER_ENABLED` | `true` | 是否在本进程跑 iLink 轮询与回复 |
 | `MAX_BOTS_PER_WORKER` | `500` | 本进程最多同时 long-poll 的 bot 数 |
 | `REPLY_CONCURRENCY` | `16` | 进程内 LLM/发送并发 |
-| `INBOX_MAX_LEN` | `20000` | 入站队列深度上限 |
+| `INBOX_MAX_LEN` | `20000` | 每机器人 Redis 入站保留消息上限（含失败任务）；满载不推进游标 |
 
 ### 管理后台广播（纯文本推送）
 
@@ -202,7 +204,11 @@ Auth: **Cookie 会话**（OAuth 登录后 `wa_session`），`credentials: includ
 | `pollable` | 应被轮询的 bot（active + token + 未 pause） |
 | `nodesOnline` / `nodesTotal` | 在线 / 注册部署节点数 |
 | `atCapacity` | 任一点触顶或舰队已满 |
-| `inboxDepth` 等 | **当前应答节点本机** inbox/任务计数（非全舰队加总） |
+| `inboxDepth` / `inboxFailed` | 当前节点所持机器人在 Redis 的待处理 / 失败任务数（非全舰队加总） |
+| `inboxPeak` | 当前节点观测到的待处理任务数峰值 |
+| `inboxDropped` / `lastInboxDropAt` | 兼容旧客户端的保留字段；持久化队列不主动丢弃，分别为 `0` / `null` |
+
+失败任务元数据为 `id`、`peerId`、`enqueuedAt`、`error`（通用分类）；重试成功为 `{ "ok": true }`，机器人或失败任务不存在返回 404。自动处理最多 3 次，之后保留供人工恢复，详见 [失败消息恢复](./runbook.md#失败消息恢复)。
 
 ### 超管（super admin）
 

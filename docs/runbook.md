@@ -253,8 +253,22 @@ pnpm dev
 API 与 iLink Worker **同进程**（单镜像 / 单容器）。
 
 - 收消息：`getUpdates` 长轮询（每 bot 一路，有 `MAX_BOTS_PER_WORKER` 上限）
-- 回消息：进程内 inbox 队列 + `REPLY_CONCURRENCY` 并发，避免 LLM 堵住轮询
+- 回消息：Redis 持久化 inbox + `REPLY_CONCURRENCY` 并发，同一机器人/聊天对象按序处理，避免 LLM 堵住轮询
 - 日志出现 `at capacity`：提高 `MAX_BOTS_PER_WORKER`，或同镜像多副本分片
+
+### 失败消息恢复
+
+入队成功后才推进收取游标。处理租约默认 120 秒、每 40 秒续期；进程丢失后，当前机器人归属节点在租约到期后重新处理，已确认完成的生成/发送步骤会复用。
+连续 3 次处理失败或中断的消息移入失败队列，后续同对象消息可继续。人工重试会把失败消息追加到该聊天对象队尾，重置尝试次数并保留检查点，因此较新的消息可能已先回复。
+
+1. 用超管登录会话调用 `GET /api/v1/admin/bots/:botId/inbox`，读取 `pending`、`failed` 和最多 100 条 `failedJobs` 元数据。
+2. 检查应用日志并修复实际原因（如 LLM/iLink 不可用、账号会话过期）。查询接口不返回正文、context token 或媒体密钥。
+3. 对选中的任务调用 `POST /api/v1/admin/bots/:botId/inbox/:jobId/retry`，成功返回 `{ "ok": true }` 并记录 `admin_inbound_retry` 审计。
+
+`INBOX_MAX_LEN` 按机器人计算，包含失败消息。满载时收取批次重试、游标不前进；留意 Redis 内存和失败数量。
+队列依赖共享 Redis 的持久化且禁止逐出，ACK 后清理 payload，失败消息不会自动到期；删除机器人会一并清理队列。
+发送确认丢失时会用相同 `client_id` 重试，但未经真实 iLink 去重验证，不能视为 exactly-once。
+节点升级、回滚和敏感数据保护要求见 [Docker 部署文档](./docker.md#持久化回复与交付边界)。
 
 ## 5. 故障
 
@@ -278,6 +292,7 @@ API 与 iLink Worker **同进程**（单镜像 / 单容器）。
 
 - Upstash：控制台备份 / 导出（按套餐）
 - Redis `wa:bot:{id}:creds`（Bot token，敏感）
+- Redis `wa:bot:{id}:inbound:*`（待处理/失败消息、context token、媒体凭据、回复检查点，敏感；备份须与其余机器人数据保持一致）
 - `.env`（勿提交 Git）
 
 ## 7. 文档

@@ -60,6 +60,9 @@ import {
   listAuditLogs,
   listBlockedUserIds,
   listBotAccounts,
+  listFailedInbound,
+  retryFailedInbound,
+  inboundQueueStats,
   hasBotCredentials,
   hasBotCredentialsMany,
   listBotsByOwner,
@@ -3269,6 +3272,26 @@ export async function registerRoutes(
       };
     },
   );
+
+  app.get<{ Params: { botId: string } }>("/api/v1/admin/bots/:botId/inbox", async (req, reply) => {
+    if (!await requireSuperAdmin(req, reply, ctx)) return;
+    const botId = req.params.botId;
+    if (!await getBotAccount(ctx.db, botId)) return reply.code(404).send({ error: "bot_not_found" });
+    return {
+      ...await inboundQueueStats(ctx.db, [botId]),
+      failedJobs: await listFailedInbound(ctx.db, botId),
+    };
+  });
+
+  app.post<{ Params: { botId: string; jobId: string } }>("/api/v1/admin/bots/:botId/inbox/:jobId/retry", async (req, reply) => {
+    const admin = await requireSuperAdmin(req, reply, ctx);
+    if (!admin) return;
+    const { botId, jobId } = req.params;
+    if (!await getBotAccount(ctx.db, botId)) return reply.code(404).send({ error: "bot_not_found" });
+    if (!await retryFailedInbound(ctx.db, botId, jobId)) return reply.code(404).send({ error: "failed_job_not_found" });
+    await writeAudit(ctx.db, "admin_inbound_retry", admin.id, { botId, jobId });
+    return { ok: true };
+  });
 
   /** Start/restart workers for every active bot that has Redis credentials. */
   app.post("/api/v1/admin/workers/restart-all", async (req, reply) => {

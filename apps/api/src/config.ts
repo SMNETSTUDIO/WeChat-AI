@@ -117,6 +117,7 @@ export interface AppConfig {
   workerWeightTtlSec: number;
   /** Concurrent LLM/reply jobs */
   replyConcurrency: number;
+  /** Retained Redis inbound jobs per bot, including failed jobs. */
   inboxMaxLen: number;
   logLevel: LogLevel;
   /** Requests slower than this are logged at warn even when they succeed */

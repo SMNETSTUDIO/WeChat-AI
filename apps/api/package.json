@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "ilink:login": "tsx src/cli-login.ts",
     "diag": "tsx src/cli-doctor.ts",
-    "test": "node --import tsx --test src/**/*.test.ts"
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@fastify/compress": "^8.0.1",
@@ -19,7 +19,7 @@
     "@wechat-ai/ilink": "workspace:*",
     "@wechat-ai/llm": "workspace:*",
     "dotenv": "^16.4.7",
-    "fastify": "^5.12.3",
+    "fastify": "^5.12.5",
     "tsx": "^4.19.3",
     "zod": "^3.24.2"
   },

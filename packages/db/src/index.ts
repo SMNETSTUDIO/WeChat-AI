@@ -12,5 +12,6 @@ export * from "./broadcast-repos.js";
 export * from "./bot-login-repos.js";
 export * from "./seed.js";
 export * from "./worker-fleet.js";
+export * from "./inbound-queue.js";
 export * from "./ota-paths.js";
 export * from "./ota-repos.js";

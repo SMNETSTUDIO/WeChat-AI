@@ -798,15 +798,46 @@ export async function claimBotLeases(
       // Released extras we won but don't need (capacity)
       const extra = got.slice(keep.length);
       if (extra.length) {
-        const drop = db.redis.pipeline();
-        for (const botId of extra) {
-          drop.del(K.botLease(botId));
-        }
-        await drop.exec();
+        await releaseOwnedLeasesBatch(db, workerId, extra);
       }
     }
   }
   return claimed;
+}
+
+// The ownership check and mutation must execute together. A GET followed by
+// SET/DEL (even in pipelines) lets a delayed old node overwrite or delete a
+// successor's lease after expiry/rebalance. EXPIRE also cannot resurrect an
+// expired lease. These scripts run on the same shared Redis as the bot data.
+const RENEW_BOT_LEASE = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[3])
+end
+redis.call('SREM', KEYS[2], ARGV[2])
+return 0
+`;
+
+const RELEASE_BOT_LEASE = `
+redis.call('SREM', KEYS[2], ARGV[2])
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+/** Do not report a Redis command error or missing reply as a successful write. */
+function leaseResults(
+  rows: Array<[Error | null, unknown]> | null,
+  count: number,
+): boolean[] {
+  if (!rows || rows.length !== count) {
+    throw new Error("Incomplete bot lease results");
+  }
+  return rows.map(([error, value]) => {
+    if (error) throw error;
+    if (value !== 0 && value !== 1) throw new Error("Invalid bot lease result");
+    return value === 1;
+  });
 }
 
 /** Renew leases we still own; drop local ownership if stolen/expired. */
@@ -820,30 +851,20 @@ export async function renewOwnedLeases(
   const lost: string[] = [];
   if (!botIds.length) return { renewed, lost };
 
-  // Batch GET (one RTT)
-  const getPipe = db.redis.pipeline();
-  for (const botId of botIds) getPipe.get(K.botLease(botId));
-  const gets = await getPipe.exec();
-
-  const setPipe = db.redis.pipeline();
-  const lostIds: string[] = [];
-  botIds.forEach((botId, i) => {
-    const row = gets?.[i];
-    const owner = row && !row[0] ? (row[1] as string | null) : null;
-    if (owner === workerId) {
-      setPipe.set(K.botLease(botId), workerId, "EX", ttlSec);
-      renewed.push(botId);
-    } else {
-      lostIds.push(botId);
-      lost.push(botId);
-    }
-  });
-  if (renewed.length) await setPipe.exec();
-  if (lostIds.length) {
-    const rem = db.redis.pipeline();
-    for (const botId of lostIds) rem.srem(K.workerBots(workerId), botId);
-    await rem.exec();
+  const pipe = db.redis.pipeline();
+  for (const botId of botIds) {
+    pipe.eval(
+      RENEW_BOT_LEASE,
+      2,
+      K.botLease(botId),
+      K.workerBots(workerId),
+      workerId,
+      botId,
+      ttlSec,
+    );
   }
+  const results = leaseResults(await pipe.exec(), botIds.length);
+  botIds.forEach((botId, i) => (results[i] ? renewed : lost).push(botId));
   return { renewed, lost };
 }
 
@@ -879,11 +900,14 @@ export async function releaseBotLease(
   workerId: string,
   botId: string,
 ): Promise<void> {
-  const owner = await db.redis.get(K.botLease(botId));
-  if (owner === workerId) {
-    await db.redis.del(K.botLease(botId));
-  }
-  await db.redis.srem(K.workerBots(workerId), botId);
+  await db.redis.eval(
+    RELEASE_BOT_LEASE,
+    2,
+    K.botLease(botId),
+    K.workerBots(workerId),
+    workerId,
+    botId,
+  );
 }
 
 /**
@@ -897,23 +921,19 @@ export async function releaseOwnedLeasesBatch(
   botIds: string[],
 ): Promise<string[]> {
   if (!botIds.length) return [];
-  const getPipe = db.redis.pipeline();
-  for (const botId of botIds) getPipe.get(K.botLease(botId));
-  const gets = await getPipe.exec();
-
-  const released: string[] = [];
-  const delPipe = db.redis.pipeline();
-  botIds.forEach((botId, i) => {
-    const row = gets?.[i];
-    const owner = row && !row[0] ? (row[1] as string | null) : null;
-    if (owner === workerId) {
-      delPipe.del(K.botLease(botId));
-      delPipe.srem(K.workerBots(workerId), botId);
-      released.push(botId);
-    }
-  });
-  if (released.length) await delPipe.exec();
-  return released;
+  const pipe = db.redis.pipeline();
+  for (const botId of botIds) {
+    pipe.eval(
+      RELEASE_BOT_LEASE,
+      2,
+      K.botLease(botId),
+      K.workerBots(workerId),
+      workerId,
+      botId,
+    );
+  }
+  const results = leaseResults(await pipe.exec(), botIds.length);
+  return botIds.filter((_, i) => results[i]);
 }
 
 /**

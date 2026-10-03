@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { RedisStore } from "./client.js";
 import { newId, nowIso, dayKey } from "./client.js";
 import { K } from "./keys.js";
+import { deleteInboundQueue } from "./inbound-queue.js";
 import {
   defaultPersonaIdCache,
   invalidateDefaultPersonaCache,
@@ -938,6 +939,7 @@ export async function deleteBotAccount(
   await forceReleaseBotLease(db, botId);
   await db.del(K.bot(botId));
   await deleteBotCredentials(db, botId);
+  await deleteInboundQueue(db, botId);
   await db.redis.srem(K.botsAll, botId);
   if (bot.owner_user_id) {
     await db.redis.srem(K.botsByOwner(bot.owner_user_id), botId);
@@ -1044,12 +1046,19 @@ export async function setBotCursor(
   db: RedisStore,
   botId: string,
   cursor: string,
+  workerId?: string,
 ): Promise<void> {
-  const bot = await getBotAccount(db, botId);
-  if (!bot) return;
-  bot.updates_cursor = cursor;
-  bot.updated_at = nowIso();
-  await db.setJson(K.bot(botId), bot);
+  // A delayed poller must not overwrite the successor's cursor or resurrect
+  // a deleted bot row after its batch has been persisted.
+  const ok = await db.redis.eval(`
+local raw=redis.call('GET',KEYS[1])
+if not raw then return 0 end
+if ARGV[1] ~= '' and redis.call('GET',KEYS[2]) ~= ARGV[1] then return 0 end
+local bot=cjson.decode(raw)
+bot.updates_cursor=ARGV[2]; bot.updated_at=ARGV[3]
+redis.call('SET',KEYS[1],cjson.encode(bot)); return 1`,
+  2, K.bot(botId), K.botLease(botId), workerId ?? "", cursor, nowIso());
+  if (workerId && Number(ok) !== 1) throw new Error("Inbound bot lease lost");
 }
 
 export async function setBotStatus(
