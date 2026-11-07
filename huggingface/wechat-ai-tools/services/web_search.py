@@ -1,9 +1,12 @@
-"""Web search backends (DDG default; optional SearXNG / Tavily)."""
+"""Web search backends (DDG default; optional SearXNG / Tavily / Parallel)."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -37,6 +40,8 @@ async def search_web(
     limit = _clamp_max(max_results, settings)
     provider = (settings.search_provider or "ddg").strip().lower()
 
+    if provider == "parallel":
+        return await _search_parallel(q, limit, settings)
     if provider == "tavily":
         return await _search_tavily(q, limit, settings)
     if provider == "searxng":
@@ -121,4 +126,73 @@ async def _search_tavily(
                 "snippet": str(item.get("content") or ""),
             }
         )
+    return out
+
+
+async def _search_parallel(
+    query: str, limit: int, settings: Settings
+) -> list[dict[str, str]]:
+    """Call anonymous Search MCP through the official Streamable HTTP client."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    timeout = max(1.0, settings.search_timeout_ms / 1000.0)
+    try:
+        # Bound the entire handshake, discovery and search, not each HTTP request.
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers={"User-Agent": "wechat-ai-tools/1.0.0"},
+            ) as client:
+                async with streamable_http_client(
+                    "https://search.parallel.ai/mcp", http_client=client
+                ) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        if not any(tool.name == "web_search" for tool in tools.tools):
+                            raise SearchError("Parallel web_search tool unavailable")
+                        # The gateway receives independent searches, without a
+                        # conversation identity. Leave optional session_id unset
+                        # rather than inventing a shared or per-call identity.
+                        result = await session.call_tool(
+                            "web_search",
+                            {"objective": query, "search_queries": [query]},
+                        )
+                        if result.isError:
+                            raise SearchError("Parallel search returned an error")
+                        data = result.structuredContent
+                        if data is None:
+                            text = "\n".join(
+                                part.text for part in result.content if part.type == "text"
+                            )
+                            data = json.loads(text)
+    except TimeoutError as exc:
+        raise SearchError("Parallel search timed out") from exc
+    except Exception as exc:  # SDK transport failures can be nested exception groups.
+        log.warning("parallel search failed: %s", type(exc).__name__)
+        raise SearchError("Parallel search failed") from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise SearchError("Invalid Parallel search response")
+    out: list[dict[str, str]] = []
+    for item in data["results"][:limit]:
+        if not isinstance(item, dict):
+            raise SearchError("Invalid Parallel search result")
+        url = item.get("url")
+        title = item.get("title")
+        excerpts = item.get("excerpts")
+        try:
+            parsed = urlsplit(url) if isinstance(url, str) else None
+            valid_url = parsed and parsed.scheme in {"http", "https"} and parsed.hostname
+        except ValueError:
+            valid_url = False
+        if (
+            not valid_url
+            or (title is not None and not isinstance(title, str))
+            or not isinstance(excerpts, list)
+            or any(not isinstance(excerpt, str) for excerpt in excerpts)
+        ):
+            raise SearchError("Invalid Parallel search result")
+        out.append({"title": title or "", "url": url, "snippet": "\n\n".join(excerpts)})
     return out

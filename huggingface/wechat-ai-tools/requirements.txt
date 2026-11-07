@@ -2,6 +2,7 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 httpx==0.28.1
+mcp==1.30.0
 pydantic==2.11.3
 pydantic-settings==2.8.1
 duckduckgo-search==8.0.1
