@@ -50,6 +50,18 @@ UPSTREAM_DENY_PRIVATE=true
 
 鉴权：`Authorization: Bearer <TOOLS_API_KEY>` 或 `X-API-Key`。
 
+### 搜索后端 Search backends
+
+`SEARCH_PROVIDER` defaults to `ddg`. To use [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) for free, keyless web search, set this in the **tools service** environment and restart it:
+
+```env
+SEARCH_PROVIDER=parallel
+```
+
+Anonymous search uses Fast mode and needs no Parallel account or API key. It returns the same `title`, `url`, and `snippet` fields used by the main site's search tool and Chatflow search node. Existing `ddg`, `searxng` (`SEARXNG_URL`), and `tavily` (`TAVILY_API_KEY`) selections remain available. Requests still require the configured gateway `TOOLS_API_KEY`; the main site's global and persona search switches still apply.
+
+`SEARCH_TIMEOUT_MS` bounds the complete Parallel handshake and search; `SEARCH_MAX_RESULTS` caps returned results. Provider failures are reported without silently switching backends. The gateway's search API does not expose page fetching or conversation identifiers.
+
 ### `POST /v1/chat/completions`
 
 OpenAI 兼容子集。用户自定义模型示例：
